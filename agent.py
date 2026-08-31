@@ -76,6 +76,7 @@ def print_search_results(block):
 def run_turn(client: anthropic.Anthropic, messages: list) -> list:
     """跑完一輪對話:模型可能連續呼叫多次工具,直到它給出最終文字回覆為止。"""
     while True:
+        print("  ...處理中,請稍候", flush=True)
         response = client.messages.create(
             model=MODEL,
             max_tokens=4096,
