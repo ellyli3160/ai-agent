@@ -12,21 +12,28 @@
 - **`web_search`**:Claude API 內建的伺服器端工具,不用自己寫程式碼實作,模型會自動發出搜尋、讀取結果。
 - **`calculator`**:自訂工具,示範「模型呼叫 → 本地執行 → 回傳結果」這個最基本的模式。
 
-## 設定
+## 快速開始(推薦)
+
+不用自己管虛擬環境,`run.sh` 會自動處理:
 
 ```bash
-pip install -r requirements.txt
 cp .env.example .env   # 填入你的 ANTHROPIC_API_KEY
-export ANTHROPIC_API_KEY=你的key   # 或直接 export,不用 .env 也可以
+./run.sh
 ```
 
-## 執行
-
-```bash
-python agent.py
-```
+之後每次要跑,只要 `./run.sh` 就好——它會自動建立/啟用虛擬環境、確保套件是最新的,再啟動 agent。
 
 輸入 `exit` 離開。
+
+## 手動設定(如果想自己掌控每一步)
+
+```bash
+python3 -m venv venv
+source venv/bin/activate
+pip install -r requirements.txt
+export ANTHROPIC_API_KEY=你的key
+python agent.py
+```
 
 ## 之後可以練習擴充的方向
 
