@@ -5,7 +5,7 @@ import sys
 
 import anthropic
 
-MODEL = "claude-opus-5"
+MODEL = "claude-sonnet-5"
 
 WEB_SEARCH_TOOL = {
     "type": "web_search_20260209",

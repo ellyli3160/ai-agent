@@ -44,4 +44,4 @@ python agent.py
 
 ## 注意
 
-`agent.py` 預設用 `claude-opus-5`,練習/測試時如果想省錢,可以把檔案裡的 `MODEL` 改成 `claude-sonnet-5` 或 `claude-haiku-4-5`。
+`agent.py` 預設用 `claude-sonnet-5`($2/$10 per 1M tokens)。如果想要更強的推理能力,可以把檔案裡的 `MODEL` 改成 `claude-opus-5`;想更省錢則可以改成 `claude-haiku-4-5`。
