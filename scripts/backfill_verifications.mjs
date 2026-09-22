@@ -90,8 +90,16 @@ async function sb(path, init = {}) {
 // 否則單次執行會打到 1(probe) + DAILY_CALL_CAP 次，超過免費方案的每日上限。
 let callCount = 0;
 
-/** 取回 { 'YYYY-MM-DD': close }。每次呼叫都計入 callCount（含 probe）。 */
-async function fetchDailyCloses(symbol, from, to) {
+/**
+ * 取回 { 'YYYY-MM-DD': close }。每次呼叫都計入 callCount（含 probe）。
+ *
+ * 不接受 from 下限：Alpha Vantage 的 TIME_SERIES_DAILY 不支援日期區間查詢，
+ * compact 一次就是回傳最近約 100 個交易日的全部資料。早期沿用 Stooq 版本
+ * 留下的「date < from 就丟棄」邏輯是個 bug——會把報告日之前的資料自己砍掉，
+ * 導致下游誤判成「視窗涵蓋不到」而跳過，即使 API 明明有回傳那些日期。
+ * 這裡只保留 to 上限，避免抓到不必要的未來雜訊。
+ */
+async function fetchDailyCloses(symbol, to) {
   callCount++;
   const url = 'https://www.alphavantage.co/query'
             + `?function=TIME_SERIES_DAILY&symbol=${encodeURIComponent(symbol)}`
@@ -112,7 +120,7 @@ async function fetchDailyCloses(symbol, from, to) {
 
   const out = {};
   for (const [date, ohlc] of Object.entries(series)) {
-    if (date < from || date > to) continue;
+    if (date > to) continue;
     const close = Number(ohlc['4. close']);
     if (Number.isFinite(close) && close > 0) out[date] = close;
   }
@@ -120,11 +128,11 @@ async function fetchDailyCloses(symbol, from, to) {
 }
 
 /** 節流版本：呼叫前檢查每日額度，呼叫後強制間隔，供主流程使用。 */
-async function fetchDailyClosesThrottled(symbol, from, to) {
+async function fetchDailyClosesThrottled(symbol, to) {
   if (callCount >= DAILY_CALL_CAP) {
     throw new Error('DAILY_CAP_REACHED');
   }
-  const result = await fetchDailyCloses(symbol, from, to);
+  const result = await fetchDailyCloses(symbol, to);
   await sleep(CALL_INTERVAL_MS);
   return result;
 }
@@ -140,22 +148,25 @@ async function main() {
   }
 
   // ---- 資料源探測 ----
-  process.stdout.write('探測 Alpha Vantage 是否可用（AAPL 近 30 天）… ');
-  const probeTo   = ymd(new Date());
-  const probeFrom = ymd(new Date(Date.now() - 30 * 86400e3));
+  process.stdout.write('探測 Alpha Vantage 是否可用（AAPL compact）… ');
+  const probeTo = ymd(new Date());
   let probe;
   try {
-    probe = await fetchDailyCloses('AAPL', probeFrom, probeTo);
+    probe = await fetchDailyCloses('AAPL', probeTo);
   } catch (e) {
     console.log('失敗');
     fail(`Alpha Vantage 無法取得資料：${e.message}`);
   }
-  const probeDays = Object.keys(probe).length;
-  if (probeDays < 5) {
-    console.log(`只取到 ${probeDays} 天`);
+  const probeDates = Object.keys(probe).sort();
+  const probeDays  = probeDates.length;
+  // 健檢重點是「有沒有最近的資料」，不是「總共幾天」：
+  // 用近 30 天內至少要有幾筆資料，確認回傳的是活資料而不是舊快取或壞掉的 key
+  const recentDays = probeDates.filter(d => d >= ymd(new Date(Date.now() - 30 * 86400e3))).length;
+  if (probeDays < 5 || recentDays < 3) {
+    console.log(`只取到 ${probeDays} 天（近 30 天內 ${recentDays} 天）`);
     fail('資料筆數異常偏少，可能是 API key 無效或被限流，請確認後再跑。');
   }
-  console.log(`OK（${probeDays} 個交易日）`);
+  console.log(`OK（共 ${probeDays} 個交易日，最新 ${probeDates.at(-1)}）`);
   if (PROBE_ONLY) return;
 
   // ---- 讀取待回填的推薦 ----
@@ -166,11 +177,19 @@ async function main() {
   const done = await sb('verifications?select=recommendation_id,horizon');
   const doneSet = new Set(done.map(v => `${v.recommendation_id}|${v.horizon}`));
 
+  // 排除已確認有問題的代碼（例如核對出來是股票分割造成離群值），
+  // 用逗號分隔：EXCLUDE_SYMBOLS=AVGO,NVDA node scripts/backfill_verifications.mjs --write
+  const excludeSymbols = new Set(
+    (process.env.EXCLUDE_SYMBOLS || '').split(',').map(s => s.trim().toUpperCase()).filter(Boolean)
+  );
+  if (excludeSymbols.size) console.log(`已排除代碼：${[...excludeSymbols].join(',')}`);
+
   // 粗篩：report_date 早於 compact 視窗大概涵蓋的範圍，幾乎確定補不到，
   // 先濾掉以免浪費 API 額度去查一檔結果全部落空的股票
   const windowStart = ymd(new Date(Date.now() - COMPACT_WINDOW_CALENDAR_DAYS * 86400e3));
-  const recs = allRecs.filter(r => r.report_date >= windowStart);
-  const tooOldCount = allRecs.length - recs.length;
+  const notExcluded = allRecs.filter(r => !excludeSymbols.has(r.symbol.toUpperCase()));
+  const recs = notExcluded.filter(r => r.report_date >= windowStart);
+  const tooOldCount = notExcluded.length - recs.length;
 
   console.log(
     `推薦紀錄 ${allRecs.length} 筆，已驗證 ${done.length} 筆`
@@ -202,20 +221,20 @@ async function main() {
   );
 
   const rows = [];
+  const diagnostics = [];   // 只供印出檢查用，不會寫進資料庫
   const problems = [];
   let n = 0;
   let capReached = false;
 
   for (const [symbol, list] of remaining) {
     n++;
-    const first = list[0].report_date;
-    const last  = list.at(-1).report_date;
+    const last = list.at(-1).report_date;
     // 30 個交易日約 42 個日曆日，多抓 30 天緩衝
     const to = ymd(new Date(new Date(last).getTime() + 72 * 86400e3));
 
     let series;
     try {
-      series = await fetchDailyClosesThrottled(symbol, first, to);
+      series = await fetchDailyClosesThrottled(symbol, to);
     } catch (e) {
       if (e.message === 'DAILY_CAP_REACHED') {
         capReached = true;
@@ -266,17 +285,20 @@ async function main() {
         const target = Number(rec.target_price);
         const stop   = Number(rec.stop_loss);
 
+        const returnPct = Math.round(((price - entry) / entry) * 100000) / 1000;
+
         rows.push({
           recommendation_id:    rec.id,
           horizon,
           price_then:           Math.round(price * 10000) / 10000,
-          return_pct:           Math.round(((price - entry) / entry) * 100000) / 1000,
+          return_pct:           returnPct,
           hit_target:           Number.isFinite(target) && target > 0 ? price >= target : null,
           hit_stop:             Number.isFinite(stop)   && stop   > 0 ? price <= stop   : null,
           elapsed_trading_days: days,
           price_basis:          'close',
           source:               'alphavantage-backfill',
         });
+        diagnostics.push({ symbol, report_date: rec.report_date, horizon, entry, price_then: price, return_pct: returnPct });
       }
     }
   }
@@ -315,8 +337,34 @@ async function main() {
     );
   }
 
+  // 離群值檢查：TIME_SERIES_DAILY 是未調整的原始收盤價，不會還原股票分割。
+  // 一檔流動性好的大型股，正常不會在 3/7/30 天內漲跌超過 30%，出現這種
+  // 數字，比較可能是分割造成的價格斷崖被誤判成真實報酬，而不是真的行情。
+  const OUTLIER_THRESHOLD = 30;
+  const outliers = diagnostics
+    .filter(d => Math.abs(d.return_pct) >= OUTLIER_THRESHOLD)
+    .sort((a, b) => Math.abs(b.return_pct) - Math.abs(a.return_pct));
+  if (outliers.length) {
+    console.log(
+      `⚠️ ${outliers.length} 筆離群值（|報酬率| >= ${OUTLIER_THRESHOLD}%），`
+      + `常見原因是股票分割沒被還原，寫入前建議先核對這些股票在對應日期是否真的有分割：`
+    );
+    outliers.slice(0, 20).forEach(o => {
+      console.log(
+        `   ${o.symbol.padEnd(6)} ${o.report_date} ${o.horizon.padEnd(3)}`
+        + `  進場 ${o.entry} → ${o.price_then}`
+        + `  (${o.return_pct >= 0 ? '+' : ''}${o.return_pct.toFixed(2)}%)`
+      );
+    });
+    if (outliers.length > 20) console.log(`   …另有 ${outliers.length - 20} 筆`);
+    console.log('');
+  }
+
   if (!DO_WRITE) {
-    console.log('\n這是試跑，未寫入。確認數字合理後加上 --write 正式執行。');
+    console.log('這是試跑，未寫入。確認數字合理後加上 --write 正式執行。');
+    if (outliers.length) {
+      console.log('偵測到離群值，建議先核對過再決定要不要寫入，或考慮排除可疑的股票代碼。');
+    }
     return;
   }
 
