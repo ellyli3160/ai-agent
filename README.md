@@ -33,11 +33,30 @@ Supabase 端已經在正式專案 `daily-us-stock` 上直接執行完成：schem
 - [x] `sql/002_backfill_recommendations.sql` 已執行（過程中發現並修正了下面的
       雙重編碼問題），回填出 **98 筆 primary、355 筆 watchlist**
 - [x] `v_pending_verifications` 驗證正常，目前有 9 筆進入 3 日窗口、9 筆進入 7 日窗口
-- [ ] Finnhub Header Auth 憑證：待你建立
-- [ ] 匯入 `n8n/w4_performance_verification.json`：待你操作
+- [x] Finnhub Header Auth 憑證：已建立
+- [x] 匯入 `n8n/w4_performance_verification.json`：已匯入並手動執行成功，
+      端到端跑通（抓待驗證清單 → 查報價 → 算報酬 → 寫回 Supabase →
+      彙總 → 更新 Google Sheets），7 筆推薦正確寫入
 - [ ] 貼上 `n8n/patch_write_recommendations.json` 的兩個節點：待你操作
 - [ ] `scripts/backfill_verifications.mjs` 歷史實績回填：待你在自己的環境跑
       `--probe`（Stooq 在這裡的開發環境被 proxy 擋掉，你的環境不一定會）
+
+### W4 試跑時發現並修正的兩個 bug
+
+1. **`整理 Sheets 更新` 把「還沒驗證」誤判成「結果是 0%」。**
+   `fmt()` 對 `null` 呼叫 `Number(null)` 會得到 `0`（不是 `NaN`），
+   導致只驗證了 1 個 horizon 的列，另外兩個沒驗證過的 horizon 也顯示
+   `0.00%`。已修正為先擋掉 `null`/`undefined`。
+
+2. **`讀取彙總結果`（Supabase 節點）在單次執行裡把資料重複吐出很多份。**
+   實測時 18 筆真實資料被吐成上百筆，已在資料庫端確認
+   `v_recommendation_results` 本身沒有重複（`view_total_rows` 等於
+   `distinct recommendation_id` 數），問題出在 n8n 節點的分頁行為。
+   不深究節點內部實作，改在下游用 `recommendation_id` 去重防護。
+
+兩個修正都已推上 `n8n/w4_performance_verification.json`，並在使用者的
+正式環境重跑驗證過：輸出收斂回正確的 7 筆，數值也都正確
+（例如 `2026-09-08` → `7日 -9.44%`，不再有假的 `0.00%`）。
 
 ### 過程中發現的問題：`json_data` 是雙重編碼
 
