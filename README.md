@@ -17,6 +17,7 @@ Google Sheets 的「驗證狀態」永遠停在待驗證，3 / 7 / 30 日報酬�
 |---|---|
 | `sql/001_phase1_schema.sql` | 市場行事曆、`recommendations`、`verifications`，以及兩個 view |
 | `sql/002_backfill_recommendations.sql` | 從既有 `stock_reports` 回填 100 份歷史報告的推薦紀錄 |
+| `sql/003_backfill_watchlist_heat.sql` | 補齊 002 漏掉的 watchlist `heat` 欄位 |
 | `n8n/patch_write_recommendations.json` | 加進現有工作流的兩個節點，讓每日推薦寫進 `recommendations` |
 | `n8n/w4_performance_verification.json` | W4 績效驗證工作流，每交易日盤後回填實際報酬 |
 | `scripts/backfill_verifications.mjs` | 一次性補上歷史推薦的實際績效 |
@@ -37,7 +38,12 @@ Supabase 端已經在正式專案 `daily-us-stock` 上直接執行完成：schem
 - [x] 匯入 `n8n/w4_performance_verification.json`：已匯入並手動執行成功，
       端到端跑通（抓待驗證清單 → 查報價 → 算報酬 → 寫回 Supabase →
       彙總 → 更新 Google Sheets），7 筆推薦正確寫入
-- [ ] 貼上 `n8n/patch_write_recommendations.json` 的兩個節點：待你操作
+- [x] 貼上 `n8n/patch_write_recommendations.json` 的兩個節點：已貼上並用
+      Pin Data 對今天已執行的報告測試過，轉換邏輯正確（撞到的
+      duplicate key 錯誤是因為當天資料已被回填過，非 bug）
+- [x] `sql/003_backfill_watchlist_heat.sql` 已執行，補齊 002 漏掉的
+      watchlist `heat` 欄位（355 筆空值補到剩 164 筆，剩下的是資料源頭
+      本來就沒有這項資訊，非腳本問題）
 - [ ] `scripts/backfill_verifications.mjs` 歷史實績回填：待你在自己的環境跑
       `--probe`（Stooq 在這裡的開發環境被 proxy 擋掉，你的環境不一定會）
 
