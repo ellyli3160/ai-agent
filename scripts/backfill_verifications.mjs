@@ -3,29 +3,36 @@
  * 歷史實績回填
  *
  * W4 每日驗證取的是「執行當下」的報價，因此只能驗證從今天起產生的推薦。
- * 既有的 89 筆歷史首選推薦，驗證窗口都已經過去，需要用歷史收盤價一次補上。
+ * 既有的歷史推薦，驗證窗口都已經過去，需要用歷史收盤價一次補上。
  * 補完之後記憶層立刻有樣本，不必等三個月。
  *
- * 資料來源：Stooq 的免費每日 CSV（不需 API key）
- *   https://stooq.com/q/d/l/?s=nvda.us&d1=20260824&d2=20261030&i=d
+ * 資料來源：Alpha Vantage TIME_SERIES_DAILY（免費，需申請 API key）
+ *   https://www.alphavantage.co/support/#api-key
  *
- * ⚠️ 這個端點無法在開發環境中實測（proxy 阻擋外部網域），請先用 --probe
- *    確認能取到資料再跑正式回填。若 Stooq 不可用，見檔案末端的替代方案。
+ * ⚠️ 原本規劃用 Stooq（免 key），但實測後（包含使用者自己的電腦）都連不上，
+ *    回傳的是一個網頁而不是 CSV，判斷是該端點加了防爬蟲機制。已改用
+ *    Alpha Vantage 作為主要資料源。
+ *
+ * ⚠️ 免費方案限制：每分鐘 5 次、每天 25 次請求。這支腳本會自動節流
+ *    （每次呼叫間隔 13 秒）並在額度用完時優雅停止，已完成的部分不會遺失，
+ *    「明天」重新執行同一個指令即可從中斷處接著跑（已驗證過的組合會自動略過）。
  *
  * 用法：
  *   export SUPABASE_URL=https://xxxx.supabase.co
  *   export SUPABASE_SERVICE_KEY=eyJ...          # service_role key
+ *   export ALPHA_VANTAGE_KEY=xxxxxxxx           # https://www.alphavantage.co/support/#api-key
  *
  *   node scripts/backfill_verifications.mjs --probe   # 只測資料源是否可用
  *   node scripts/backfill_verifications.mjs           # 試跑，印出結果但不寫入
  *   node scripts/backfill_verifications.mjs --write   # 實際寫入 verifications
  */
 
-const SUPABASE_URL = process.env.SUPABASE_URL;
-const SERVICE_KEY  = process.env.SUPABASE_SERVICE_KEY;
-const ARGS         = new Set(process.argv.slice(2));
-const DO_WRITE     = ARGS.has('--write');
-const PROBE_ONLY   = ARGS.has('--probe');
+const SUPABASE_URL      = process.env.SUPABASE_URL;
+const SERVICE_KEY       = process.env.SUPABASE_SERVICE_KEY;
+const ALPHA_VANTAGE_KEY = process.env.ALPHA_VANTAGE_KEY;
+const ARGS              = new Set(process.argv.slice(2));
+const DO_WRITE          = ARGS.has('--write');
+const PROBE_ONLY        = ARGS.has('--probe');
 
 const HORIZONS = [
   { horizon: '3d',  days: 3  },
@@ -36,9 +43,12 @@ const HORIZONS = [
 // 進場價與當日收盤的合理偏差上限。超過代表資料對不上，該筆不回填。
 const ENTRY_TOLERANCE = 0.05;
 
+// 免費方案：每分鐘 5 次、每天 25 次。用 13 秒間隔換算約每分鐘 4.6 次，留一點餘裕。
+const CALL_INTERVAL_MS = 13_000;
+const DAILY_CALL_CAP   = 25;
+
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 const ymd   = (d) => d.toISOString().slice(0, 10);
-const compact = (s) => s.replaceAll('-', '');
 
 function fail(msg) {
   console.error(`\n✗ ${msg}\n`);
@@ -62,47 +72,62 @@ async function sb(path, init = {}) {
   return res.status === 204 ? null : res.json();
 }
 
-// ------------------------------------------------------------------ Stooq
-/** 美股代碼轉 Stooq 格式：BRK.B → brk-b.us */
-const toStooq = (symbol) =>
-  `${symbol.toLowerCase().replaceAll('.', '-')}.us`;
+// ----------------------------------------------------------- Alpha Vantage
+// probe 也會實際打一次 API，必須跟主流程共用同一個計數器，
+// 否則單次執行會打到 1(probe) + DAILY_CALL_CAP 次，超過免費方案的每日上限。
+let callCount = 0;
 
-/** 取回 { 'YYYY-MM-DD': close } */
+/** 取回 { 'YYYY-MM-DD': close }。每次呼叫都計入 callCount（含 probe）。 */
 async function fetchDailyCloses(symbol, from, to) {
-  const url = `https://stooq.com/q/d/l/?s=${toStooq(symbol)}`
-            + `&d1=${compact(from)}&d2=${compact(to)}&i=d`;
+  callCount++;
+  const url = 'https://www.alphavantage.co/query'
+            + `?function=TIME_SERIES_DAILY&symbol=${encodeURIComponent(symbol)}`
+            + `&outputsize=full&apikey=${ALPHA_VANTAGE_KEY}`;
   const res = await fetch(url);
   if (!res.ok) throw new Error(`HTTP ${res.status}`);
 
-  const text = await res.text();
-  const lines = text.trim().split('\n');
-  if (lines.length < 2 || !lines[0].toLowerCase().startsWith('date')) {
-    throw new Error(`回應非預期格式：${text.slice(0, 80)}`);
+  const data = await res.json();
+
+  if (data['Error Message']) throw new Error(`代碼無效或不存在：${data['Error Message']}`);
+  if (data['Note'])          throw new Error(`已被限流：${data['Note']}`);
+  if (data['Information'])   throw new Error(`API 限制：${data['Information']}`);
+
+  const series = data['Time Series (Daily)'];
+  if (!series) {
+    throw new Error(`回應缺少 Time Series (Daily)，原始回應前 200 字：${JSON.stringify(data).slice(0, 200)}`);
   }
 
-  const header = lines[0].split(',').map(h => h.trim().toLowerCase());
-  const iDate  = header.indexOf('date');
-  const iClose = header.indexOf('close');
-  if (iDate < 0 || iClose < 0) throw new Error('CSV 缺少 Date 或 Close 欄位');
-
   const out = {};
-  for (const line of lines.slice(1)) {
-    const cells = line.split(',');
-    const close = Number(cells[iClose]);
-    if (cells[iDate] && Number.isFinite(close) && close > 0) out[cells[iDate]] = close;
+  for (const [date, ohlc] of Object.entries(series)) {
+    if (date < from || date > to) continue;
+    const close = Number(ohlc['4. close']);
+    if (Number.isFinite(close) && close > 0) out[date] = close;
   }
   return out;
 }
 
+/** 節流版本：呼叫前檢查每日額度，呼叫後強制間隔，供主流程使用。 */
+async function fetchDailyClosesThrottled(symbol, from, to) {
+  if (callCount >= DAILY_CALL_CAP) {
+    throw new Error('DAILY_CAP_REACHED');
+  }
+  const result = await fetchDailyCloses(symbol, from, to);
+  await sleep(CALL_INTERVAL_MS);
+  return result;
+}
+
 // ------------------------------------------------------------------- main
 async function main() {
+  if (!ALPHA_VANTAGE_KEY) {
+    fail('請先申請並設定環境變數 ALPHA_VANTAGE_KEY（免費：https://www.alphavantage.co/support/#api-key）');
+  }
   // --probe 只測資料源，不需要 Supabase 設定
   if (!PROBE_ONLY && (!SUPABASE_URL || !SERVICE_KEY)) {
     fail('請先設定環境變數 SUPABASE_URL 與 SUPABASE_SERVICE_KEY');
   }
 
   // ---- 資料源探測 ----
-  process.stdout.write('探測 Stooq 是否可用（AAPL 近 30 天）… ');
+  process.stdout.write('探測 Alpha Vantage 是否可用（AAPL 近 30 天）… ');
   const probeTo   = ymd(new Date());
   const probeFrom = ymd(new Date(Date.now() - 30 * 86400e3));
   let probe;
@@ -110,12 +135,12 @@ async function main() {
     probe = await fetchDailyCloses('AAPL', probeFrom, probeTo);
   } catch (e) {
     console.log('失敗');
-    fail(`Stooq 無法取得資料：${e.message}\n  請改用檔案末端說明的替代資料源。`);
+    fail(`Alpha Vantage 無法取得資料：${e.message}`);
   }
   const probeDays = Object.keys(probe).length;
   if (probeDays < 5) {
     console.log(`只取到 ${probeDays} 天`);
-    fail('資料筆數異常偏少，可能被限流或代碼格式不符，請人工確認後再跑。');
+    fail('資料筆數異常偏少，可能是 API key 無效或被限流，請確認後再跑。');
   }
   console.log(`OK（${probeDays} 個交易日）`);
   if (PROBE_ONLY) return;
@@ -135,13 +160,28 @@ async function main() {
     if (!bySymbol.has(r.symbol)) bySymbol.set(r.symbol, []);
     bySymbol.get(r.symbol).push(r);
   }
-  console.log(`需查詢 ${bySymbol.size} 檔歷史報價\n`);
+
+  // 這檔股票底下的推薦，是否已經把「所有 horizon」都驗證過了
+  // （用來略過已完成的股票，把每日 25 次額度留給還沒做完的）
+  const isSymbolFullyDone = (list) =>
+    list.every(rec => HORIZONS.every(({ horizon }) => doneSet.has(`${rec.id}|${horizon}`)));
+
+  const remaining = [...bySymbol.entries()].filter(([, list]) => !isSymbolFullyDone(list));
+  // probe 已經用掉 1 次額度（callCount 此時是 1），今天實際還能查的檔數要扣掉這次
+  const availableToday = Math.max(0, DAILY_CALL_CAP - callCount);
+  console.log(
+    `共 ${bySymbol.size} 檔，其中 ${bySymbol.size - remaining.length} 檔已全部驗證完畢、`
+    + `${remaining.length} 檔待處理。免費額度每天 ${DAILY_CALL_CAP} 次（含剛才 probe 用掉的 1 次），`
+    + `今天還可以查 ${availableToday} 檔，`
+    + `${remaining.length > availableToday ? `預估還需要 ${Math.ceil((remaining.length - availableToday) / DAILY_CALL_CAP) + 1} 天跑完` : '今天應該可以跑完'}。\n`
+  );
 
   const rows = [];
   const problems = [];
   let n = 0;
+  let capReached = false;
 
-  for (const [symbol, list] of bySymbol) {
+  for (const [symbol, list] of remaining) {
     n++;
     const first = list[0].report_date;
     const last  = list.at(-1).report_date;
@@ -150,8 +190,12 @@ async function main() {
 
     let series;
     try {
-      series = await fetchDailyCloses(symbol, first, to);
+      series = await fetchDailyClosesThrottled(symbol, first, to);
     } catch (e) {
+      if (e.message === 'DAILY_CAP_REACHED') {
+        capReached = true;
+        break;
+      }
       problems.push(`${symbol}：取價失敗（${e.message}）`);
       continue;
     }
@@ -160,7 +204,7 @@ async function main() {
       problems.push(`${symbol}：資料僅 ${dates.length} 天，略過`);
       continue;
     }
-    process.stdout.write(`\r[${n}/${bySymbol.size}] ${symbol.padEnd(6)} ${dates.length} 天  `);
+    process.stdout.write(`\r[${n}/${remaining.length}] ${symbol.padEnd(6)} ${dates.length} 天  `);
 
     for (const rec of list) {
       const entry = Number(rec.entry_price);
@@ -199,13 +243,19 @@ async function main() {
           hit_stop:             Number.isFinite(stop)   && stop   > 0 ? price <= stop   : null,
           elapsed_trading_days: days,
           price_basis:          'close',
-          source:               'stooq-backfill',
+          source:               'alphavantage-backfill',
         });
       }
     }
-    await sleep(400);   // 對免費資料源客氣一點
   }
   console.log('\n');
+
+  if (capReached) {
+    console.log(
+      `⚠️ 已達今日 ${DAILY_CALL_CAP} 次額度上限，還有 ${remaining.length - n + 1} 檔沒處理。`
+      + `明天直接重跑同一個指令即可（已完成的股票與組合會自動略過，不會重複扣額度）。\n`
+    );
+  }
 
   // ---- 摘要 ----
   if (problems.length) {
@@ -215,10 +265,10 @@ async function main() {
     console.log('');
   }
 
-  if (!rows.length) return console.log('沒有可回填的資料。');
+  if (!rows.length) return console.log('這次沒有可回填的資料。');
 
   const by = (h) => rows.filter(r => r.horizon === h).map(r => r.return_pct);
-  console.log(`可回填 ${rows.length} 筆：`);
+  console.log(`這次可回填 ${rows.length} 筆：`);
   for (const { horizon } of HORIZONS) {
     const v = by(horizon).sort((a, b) => a - b);
     if (!v.length) continue;
@@ -252,20 +302,9 @@ async function main() {
     process.stdout.write(`\r  ${written}/${rows.length}`);
   }
   console.log(`\n完成，寫入 ${written} 筆。`);
+  if (capReached) {
+    console.log('明天可以重新執行同一個指令，繼續處理剩下的股票。');
+  }
 }
 
 main().catch(e => fail(e.stack || e.message));
-
-/*
- * 替代資料源（若 Stooq 不可用）
- *
- * 1. Finnhub /stock/candle
- *    https://finnhub.io/api/v1/stock/candle?symbol=NVDA&resolution=D&from=<unix>&to=<unix>
- *    最直接，但歷史資料端點近年多半需要付費方案，先確認你的額度。
- *
- * 2. Alpha Vantage TIME_SERIES_DAILY
- *    免費方案每日 25 次請求，124 檔要分五天跑完，但完全免費且穩定。
- *
- * 兩者都只需替換 fetchDailyCloses()，回傳同樣的 { 'YYYY-MM-DD': close } 結構，
- * 其餘邏輯不必更動。
- */
