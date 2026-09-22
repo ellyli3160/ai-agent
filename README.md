@@ -23,6 +23,48 @@ Google Sheets 的「驗證狀態」永遠停在待驗證，3 / 7 / 30 日報酬�
 
 ---
 
+## 目前狀態（2026-09-22）
+
+Supabase 端已經在正式專案 `daily-us-stock` 上直接執行完成：schema 建好、
+歷史報告已回填。n8n 端沒有可用的連線工具，需要你自己在 n8n 介面上操作。
+
+- [x] `sql/001_phase1_schema.sql` 已執行，`market_holidays`／`recommendations`／
+      `verifications` 三張表與兩個 view 都在
+- [x] `sql/002_backfill_recommendations.sql` 已執行（過程中發現並修正了下面的
+      雙重編碼問題），回填出 **98 筆 primary、355 筆 watchlist**
+- [x] `v_pending_verifications` 驗證正常，目前有 9 筆進入 3 日窗口、9 筆進入 7 日窗口
+- [ ] Finnhub Header Auth 憑證：待你建立
+- [ ] 匯入 `n8n/w4_performance_verification.json`：待你操作
+- [ ] 貼上 `n8n/patch_write_recommendations.json` 的兩個節點：待你操作
+- [ ] `scripts/backfill_verifications.mjs` 歷史實績回填：待你在自己的環境跑
+      `--probe`（Stooq 在這裡的開發環境被 proxy 擋掉，你的環境不一定會）
+
+### 過程中發現的問題：`json_data` 是雙重編碼
+
+實測時發現 `stock_reports.json_data` 的 `jsonb_typeof` 對全部 110 列都回傳
+`'string'`，不是預期的 `'object'`。追查到 n8n 工作流「supabase」Code 節點：
+
+```js
+json_data: JSON.stringify(item.json.json_data)
+```
+
+物件先被字串化一次，Supabase 節點寫入 jsonb 欄位時又編碼一次，結果變成
+「一個字串，內容剛好是 JSON 文字」。**從第一筆資料（2025-03-23）就是這樣，
+不是最近才壞的。** `sql/002_backfill_recommendations.sql` 已經用
+`(json_data #>> '{}')::jsonb` 多解開一層處理過，回填結果是正確的。
+
+建議你把 n8n 那個節點改成：
+
+```js
+json_data: item.json.json_data
+```
+
+不要再 `JSON.stringify`，讓未來寫入的資料是正常的 jsonb 物件。這不影響
+`recommendations` 的寫入（`拆出推薦紀錄` 節點是從報告物件直接讀，不經過
+`stock_reports`），只影響任何直接查 `stock_reports.json_data` 的工具，源頭修掉比較乾淨，但不改也不會壞任何東西。
+
+---
+
 ## 安裝順序
 
 ### 1. 建立 schema
@@ -34,7 +76,8 @@ sql/001_phase1_schema.sql
 sql/002_backfill_recommendations.sql
 ```
 
-檔案最後都有驗收查詢。`002` 執行後應看到約 89 筆 primary 與 300 筆左右的 watchlist。
+> 已在 `daily-us-stock` 專案上實際執行過，見上方「目前狀態」。
+> 如果你要在別的專案重新跑一次，檔案最後有驗收查詢可以核對。
 
 ### 2. 建立 Finnhub 憑證
 
@@ -88,22 +131,31 @@ node scripts/backfill_verifications.mjs --write   # 確認數字合理後正式�
 
 ## 驗證狀況
 
-**已實測：**
-- `拆出推薦紀錄` 的邏輯跑過全部 100 份歷史報告，產出 90 筆首選、324 筆觀察，
-  無無效代碼、無唯一鍵衝突，10 個觀望日正確略過
+**已在正式 Supabase 專案上實測：**
+- `sql/001_phase1_schema.sql` 執行成功，三張表、兩個 view、`trading_days_between()`
+  函式都正常。`security_invoker` 語法在 PG17 上沒問題
+- `sql/002_backfill_recommendations.sql` 執行成功，回填 98 筆 primary、355 筆 watchlist
+- `v_pending_verifications` 邏輯正確：9 筆在 3 日窗口、9 筆在 7 日窗口
+- 過程中抓到並修正了 `json_data` 雙重編碼的問題（見上方說明）
+- 也抓到並修正了我自己寫錯的一則測試案例註解（`001` 檔案最後，
+  跨勞動節的交易日數原本誤寫成 3，實際是 2）
+
+**已用 CSV 快照實測（邏輯驗證，非正式環境）：**
+- `拆出推薦紀錄` 的邏輯跑過 100 份歷史報告快照，無無效代碼、無唯一鍵衝突，
+  觀望日正確略過（正式環境上跑出的數字略有不同是因為多了 10 天資料，
+  以及套用了雙重編碼修正，以正式環境的 98／355 為準）
 - 所有 n8n Code 節點的 JS 通過 `node --check`
 - 兩份工作流 JSON 可正確解析
-- 回填腳本的錯誤處理路徑（資料源不可用時的失敗訊息）
 
 **未能實測，請自行確認：**
 - Stooq 歷史報價端點（開發環境的 proxy 阻擋外部網域，`--probe` 直接回 403）。
   若不可用，腳本末端有 Finnhub `/stock/candle` 與 Alpha Vantage 的替代方案，
   只需替換 `fetchDailyCloses()` 一個函式
-- SQL 未在實際 Supabase 執行過。`security_invoker` 需要 PostgreSQL 15 以上，
-  若報錯可略過那兩行
 - 行事曆的 Good Friday 依復活節推算，建議對照 NYSE 官方行事曆確認
 - n8n Supabase 節點讀取 view 的行為。若 `tableId` 下拉選單看不到 view，
   改用 HTTP Request 節點打 `{SUPABASE_URL}/rest/v1/v_pending_verifications`
+- 這個 session 沒有 n8n 的連線工具，W4 匯入、patch 節點、Finnhub 憑證
+  這幾步無法由我直接操作，需要你自己在 n8n 介面上完成
 
 ---
 
