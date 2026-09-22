@@ -17,6 +17,14 @@
  *    （每次呼叫間隔 13 秒）並在額度用完時優雅停止，已完成的部分不會遺失，
  *    「明天」重新執行同一個指令即可從中斷處接著跑（已驗證過的組合會自動略過）。
  *
+ * ⚠️ 免費方案的 TIME_SERIES_DAILY 只能用 outputsize=compact（最近約 100 個
+ *    交易日，從「今天」往回算，不是從你指定的日期算），outputsize=full
+ *    （完整歷史）已被鎖進付費方案。這代表報告日期太舊的推薦（早於 compact
+ *    視窗涵蓋範圍）永遠補不到，不是查不準，是 API 根本不會回傳那麼久以前
+ *    的資料。腳本會先用粗略的日期門檻跳過明顯太舊的推薦（省 API 額度），
+ *    抓到實際資料後再用真實日期範圍二次確認，兩層都是為了避免把「用視窗
+ *    起點誤當成報告日期」算出來的錯誤報酬率寫進資料庫。
+ *
  * 用法：
  *   export SUPABASE_URL=https://xxxx.supabase.co
  *   export SUPABASE_SERVICE_KEY=eyJ...          # service_role key
@@ -46,6 +54,11 @@ const ENTRY_TOLERANCE = 0.05;
 // 免費方案：每分鐘 5 次、每天 25 次。用 13 秒間隔換算約每分鐘 4.6 次，留一點餘裕。
 const CALL_INTERVAL_MS = 13_000;
 const DAILY_CALL_CAP   = 25;
+
+// compact 大約是最近 100 個交易日，約 140 個日曆日，這裡抓保守值 130 天
+// 當作粗篩門檻：report_date 早於這個門檻的推薦，幾乎確定補不到，直接跳過
+// 不浪費 API 額度。精確判斷仍以抓到資料後的實際日期範圍為準（見下方主流程）。
+const COMPACT_WINDOW_CALENDAR_DAYS = 130;
 
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 const ymd   = (d) => d.toISOString().slice(0, 10);
@@ -82,7 +95,7 @@ async function fetchDailyCloses(symbol, from, to) {
   callCount++;
   const url = 'https://www.alphavantage.co/query'
             + `?function=TIME_SERIES_DAILY&symbol=${encodeURIComponent(symbol)}`
-            + `&outputsize=full&apikey=${ALPHA_VANTAGE_KEY}`;
+            + `&outputsize=compact&apikey=${ALPHA_VANTAGE_KEY}`;
   const res = await fetch(url);
   if (!res.ok) throw new Error(`HTTP ${res.status}`);
 
@@ -146,14 +159,26 @@ async function main() {
   if (PROBE_ONLY) return;
 
   // ---- 讀取待回填的推薦 ----
-  const recs = await sb(
+  const allRecs = await sb(
     'recommendations?select=id,report_date,symbol,role,entry_price,target_price,stop_loss'
     + '&entry_price=not.is.null&order=report_date.asc'
   );
   const done = await sb('verifications?select=recommendation_id,horizon');
   const doneSet = new Set(done.map(v => `${v.recommendation_id}|${v.horizon}`));
 
-  console.log(`推薦紀錄 ${recs.length} 筆，已驗證 ${done.length} 筆`);
+  // 粗篩：report_date 早於 compact 視窗大概涵蓋的範圍，幾乎確定補不到，
+  // 先濾掉以免浪費 API 額度去查一檔結果全部落空的股票
+  const windowStart = ymd(new Date(Date.now() - COMPACT_WINDOW_CALENDAR_DAYS * 86400e3));
+  const recs = allRecs.filter(r => r.report_date >= windowStart);
+  const tooOldCount = allRecs.length - recs.length;
+
+  console.log(
+    `推薦紀錄 ${allRecs.length} 筆，已驗證 ${done.length} 筆`
+    + (tooOldCount
+        ? `\n${tooOldCount} 筆早於 ${windowStart}（compact 視窗大概涵蓋不到），`
+          + `本次不處理，除非之後換成有完整歷史的資料源`
+        : '')
+  );
 
   const bySymbol = new Map();
   for (const r of recs) {
@@ -209,17 +234,24 @@ async function main() {
     for (const rec of list) {
       const entry = Number(rec.entry_price);
 
+      // 二次確認：compact 只回傳最近約 100 個交易日，如果連 report_date
+      // 前一天都不在這個範圍內，代表這筆推薦太舊、視窗涵蓋不到。
+      // 這裡必須整筆跳過，不能繼續往下算，否則後面的 after 會誤把
+      // 「視窗起點」當成「報告日隔天」，算出一個看似正常、實則錯誤的報酬率。
+      if (dates[0] >= rec.report_date) {
+        problems.push(`${symbol} ${rec.report_date}：太舊，compact 視窗涵蓋不到（視窗最早 ${dates[0]}），略過`);
+        continue;
+      }
+
       // 進場價健檢：報告在盤前產生，進場價應接近「報告日前一個交易日」的收盤
       const before = dates.filter(d => d < rec.report_date);
-      if (before.length) {
-        const ref = series[before.at(-1)];
-        if (Math.abs(ref - entry) / ref > ENTRY_TOLERANCE) {
-          problems.push(
-            `${symbol} ${rec.report_date}：進場價 ${entry} 與前一收盤 ${ref} `
-            + `差距 ${((entry - ref) / ref * 100).toFixed(1)}%，略過`
-          );
-          continue;
-        }
+      const ref = series[before.at(-1)];
+      if (Math.abs(ref - entry) / ref > ENTRY_TOLERANCE) {
+        problems.push(
+          `${symbol} ${rec.report_date}：進場價 ${entry} 與前一收盤 ${ref} `
+          + `差距 ${((entry - ref) / ref * 100).toFixed(1)}%，略過`
+        );
+        continue;
       }
 
       // 用價格序列本身定義交易日，不需要行事曆
