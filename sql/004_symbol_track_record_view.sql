@@ -8,7 +8,15 @@
 -- 記憶，模型看不到自己過去推薦過這檔股票、結果好不好。
 --
 -- 這個 view 本身不改變任何既有資料，只是彙總 recommendations 與
--- v_recommendation_results，供 n8n 在生成報告前查詢。
+-- verifications，供 n8n 在生成報告前查詢。
+--
+-- ⚠️ 刻意不透過 v_recommendation_results：那個 view 限制只看「報告日在過去
+-- 180 天內」的資料（給 Google Sheets 同步用，設計上沒問題）。如果這裡借用
+-- 它，會在資料變舊之後出現詭異的回歸：一筆推薦已經在 verifications 表裡有
+-- 真實的驗證結果，但報告日一旦超過 180 天，就會從 v_recommendation_results
+-- 消失，導致這裡把「早就驗證過」的推薦誤算成「尚未驗證」，達標/停損次數
+-- 隨時間悄悄減少。這裡直接對 verifications 表算 bool_or，不受 180 天限制，
+-- 歷史紀錄的次數不會因為時間經過而改變。
 --
 -- 執行：在 001~003 之後執行，可重複執行（create or replace view）
 -- ============================================================================
@@ -18,11 +26,18 @@ select
   r.symbol,
   count(*) as primary_rec_count,
   max(r.report_date) as last_primary_date,
-  count(*) filter (where vr.ever_hit_target) as target_hit_count,
-  count(*) filter (where vr.ever_hit_stop) as stop_hit_count,
-  count(*) filter (where vr.recommendation_id is null) as unverified_count
+  count(*) filter (where ver.ever_hit_target) as target_hit_count,
+  count(*) filter (where ver.ever_hit_stop) as stop_hit_count,
+  count(*) filter (where ver.recommendation_id is null) as unverified_count
 from recommendations r
-left join v_recommendation_results vr on vr.recommendation_id = r.id
+left join (
+  select
+    recommendation_id,
+    bool_or(hit_target) as ever_hit_target,
+    bool_or(hit_stop)   as ever_hit_stop
+  from verifications
+  group by recommendation_id
+) ver on ver.recommendation_id = r.id
 where r.role = 'primary'
 group by r.symbol;
 
