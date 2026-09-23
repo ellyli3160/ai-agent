@@ -19,6 +19,7 @@ Google Sheets 的「驗證狀態」永遠停在待驗證，3 / 7 / 30 日報酬�
 | `sql/002_backfill_recommendations.sql` | 從既有 `stock_reports` 回填 100 份歷史報告的推薦紀錄 |
 | `sql/003_backfill_watchlist_heat.sql` | 補齊 002 漏掉的 watchlist `heat` 欄位 |
 | `sql/004_symbol_track_record_view.sql` | 候選標的歷史推薦彙總 view（記憶層第一步） |
+| `sql/005_add_vix_and_sentiment_to_recommendations.sql` | 幫 `recommendations` 加上 `vix_close`／`vix_date`／`market_sentiment` 欄位 |
 | `n8n/patch_write_recommendations.json` | 加進現有工作流的兩個節點，讓每日推薦寫進 `recommendations` |
 | `n8n/patch_history_check.json` | 加進現有工作流的兩個節點，讓報告生成前先看候選標的的歷史推薦紀錄 |
 | `n8n/patch_vix_quote.json` | 加進現有工作流的兩個節點，用 CBOE 官方資料取代模型自己猜的 VIX 指數 |
@@ -63,6 +64,12 @@ Supabase 端已經在正式專案 `daily-us-stock` 上直接執行完成：schem
 - [ ] `n8n/patch_vix_quote.json` 的兩個節點：已寫好、Code 節點邏輯已用
       使用者實測拿到的真實 CBOE 回應格式測過，**尚未貼進正式工作流**，
       需要你自己操作，步驟見下方「安裝順序」第 8 步
+- [x] `sql/005_add_vix_and_sentiment_to_recommendations.sql` 已在正式專案
+      執行，`vix_close`／`vix_date`／`market_sentiment` 三個欄位已存在
+- [ ] `n8n/patch_write_recommendations.json` 的「拆出推薦紀錄」節點程式碼
+      已更新（加入寫入 VIX 與市場情緒），Code 節點邏輯已用模擬資料測過
+      三種情境，**正式工作流裡的節點還沒換成新版**，需要你自己操作，
+      步驟見下方「安裝順序」第 9 步
 
 ### 排程自動化過程中發現並修正的 bug
 
@@ -400,6 +407,43 @@ CBOE 官方資料（不需要 API key）查真實的 VIX 收盤價，插進「�
 > 也測過資料過期、`data` 不是字串、CSV 只剩標題列三種異常情境，行為都
 > 符合預期，但沒有在正式的 n8n 環境跑過，第一次上線請照上面 e 步驟手動
 > 測一次。
+
+### 9. 把 VIX 與市場情緒也寫進資料庫
+
+目的：VIX 存進資料庫之後，才能回頭用資料查兩件事——(1) 系統在高 VIX
+（恐慌）環境下的實際勝率是不是真的比較差，(2) 模型自己寫的
+`market_sentiment` 是否真的符合它自己訂的 VIX 門檻（看多 < 18、
+中性 18-25、看空 > 25），而不是只能憑印象判斷。
+
+**這一步要先完成第 8 步**（`解析VIX指數` 節點要存在，下面的程式碼會讀它）。
+
+**a. 先跑 migration**
+
+```
+sql/005_add_vix_and_sentiment_to_recommendations.sql
+```
+
+只是加三個欄位（`vix_close`／`vix_date`／`market_sentiment`），不影響
+既有資料。`market_sentiment` 直接存模型輸出的原始字串，不拆解成 enum——
+之前分析歷史資料就發現這個欄位實際出現過 7 種不同寫法，拆解反而會遺失
+原始資訊。
+
+**b. 更新「拆出推薦紀錄」節點的程式碼**
+
+這個節點已經在你的正式工作流裡（第 4 步貼的），不是貼新節點，是要把
+它裡面的 JS 換成新版。複製 `n8n/patch_write_recommendations.json` 裡
+`jsCode` 的完整內容，貼掉「拆出推薦紀錄」節點原本的程式碼。
+
+新版跟舊版的差別只有兩處：多讀取 `$('解析VIX指數')` 拿 `vix_close`／
+`vix_date`，多讀取報告 JSON 本來就有的 `market_sentiment` 欄位，兩者都
+會寫進首選標的跟觀察名單的每一列（VIX 跟市場情緒是整份報告共用的值，
+不是個股層級的資訊）。取不到「解析VIX指數」節點時會留空、不會中斷寫入，
+已用模擬資料測過三種情境（正常、取不到解析VIX指數節點、市場情緒缺欄位）。
+
+**c. 測試**
+
+用 Pin Data 固定「解析VIX指數」節點的輸出，執行「拆出推薦紀錄」，確認
+輸出的每一列都有正確的 `vix_close`／`vix_date`／`market_sentiment`。
 
 ---
 
