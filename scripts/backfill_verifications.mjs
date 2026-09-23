@@ -33,6 +33,12 @@
  *   node scripts/backfill_verifications.mjs --probe   # 只測資料源是否可用
  *   node scripts/backfill_verifications.mjs           # 試跑，印出結果但不寫入
  *   node scripts/backfill_verifications.mjs --write   # 實際寫入 verifications
+ *
+ *   # 排程／CI 用：自動跳過離群值（不寫入但會印出來），適合沒有人盯著的場合
+ *   node scripts/backfill_verifications.mjs --write --skip-outliers
+ *
+ *   # 排除已確認有問題的代碼（例如核對出來是股票分割），逗號分隔
+ *   EXCLUDE_SYMBOLS=AVGO,NVDA node scripts/backfill_verifications.mjs --write
  */
 
 const SUPABASE_URL      = process.env.SUPABASE_URL;
@@ -41,6 +47,7 @@ const ALPHA_VANTAGE_KEY = process.env.ALPHA_VANTAGE_KEY;
 const ARGS              = new Set(process.argv.slice(2));
 const DO_WRITE          = ARGS.has('--write');
 const PROBE_ONLY        = ARGS.has('--probe');
+const SKIP_OUTLIERS     = ARGS.has('--skip-outliers');
 
 const HORIZONS = [
   { horizon: '3d',  days: 3  },
@@ -298,7 +305,10 @@ async function main() {
           price_basis:          'close',
           source:               'alphavantage-backfill',
         });
-        diagnostics.push({ symbol, report_date: rec.report_date, horizon, entry, price_then: price, return_pct: returnPct });
+        diagnostics.push({
+          recommendation_id: rec.id, symbol, report_date: rec.report_date,
+          horizon, entry, price_then: price, return_pct: returnPct,
+        });
       }
     }
   }
@@ -321,8 +331,29 @@ async function main() {
 
   if (!rows.length) return console.log('這次沒有可回填的資料。');
 
-  const by = (h) => rows.filter(r => r.horizon === h).map(r => r.return_pct);
-  console.log(`這次可回填 ${rows.length} 筆：`);
+  // 離群值檢查：TIME_SERIES_DAILY 是未調整的原始收盤價，不會還原股票分割。
+  // 一檔流動性好的大型股，正常不會在 3/7/30 天內漲跌超過 30%，出現這種
+  // 數字，比較可能是分割造成的價格斷崖被誤判成真實報酬，而不是真的行情。
+  const OUTLIER_THRESHOLD = 30;
+  const outliers = diagnostics
+    .filter(d => Math.abs(d.return_pct) >= OUTLIER_THRESHOLD)
+    .sort((a, b) => Math.abs(b.return_pct) - Math.abs(a.return_pct));
+
+  // --skip-outliers：排程／CI 用，沒有人盯著時自動把離群值從寫入清單拿掉，
+  // 避免可疑資料在沒人看見的情況下悄悄污染統計。互動模式下預設不排除，
+  // 因為使用者可能想自己看過摘要再判斷。
+  let effectiveRows = rows;
+  if (SKIP_OUTLIERS && outliers.length) {
+    const skipKeys = new Set(outliers.map(o => `${o.recommendation_id}|${o.horizon}`));
+    effectiveRows = rows.filter(r => !skipKeys.has(`${r.recommendation_id}|${r.horizon}`));
+  }
+
+  const by = (h) => effectiveRows.filter(r => r.horizon === h).map(r => r.return_pct);
+  console.log(
+    `這次可回填 ${effectiveRows.length} 筆`
+    + (effectiveRows.length !== rows.length ? `（另有 ${rows.length - effectiveRows.length} 筆離群值被 --skip-outliers 排除）` : '')
+    + '：'
+  );
   for (const { horizon } of HORIZONS) {
     const v = by(horizon).sort((a, b) => a - b);
     if (!v.length) continue;
@@ -337,17 +368,13 @@ async function main() {
     );
   }
 
-  // 離群值檢查：TIME_SERIES_DAILY 是未調整的原始收盤價，不會還原股票分割。
-  // 一檔流動性好的大型股，正常不會在 3/7/30 天內漲跌超過 30%，出現這種
-  // 數字，比較可能是分割造成的價格斷崖被誤判成真實報酬，而不是真的行情。
-  const OUTLIER_THRESHOLD = 30;
-  const outliers = diagnostics
-    .filter(d => Math.abs(d.return_pct) >= OUTLIER_THRESHOLD)
-    .sort((a, b) => Math.abs(b.return_pct) - Math.abs(a.return_pct));
   if (outliers.length) {
+    const suffix = SKIP_OUTLIERS
+      ? (DO_WRITE ? '，本次已跳過不寫入' : '，若加上 --write 會被自動排除不寫入')
+      : '，寫入前建議先核對這些股票在對應日期是否真的有分割';
     console.log(
-      `⚠️ ${outliers.length} 筆離群值（|報酬率| >= ${OUTLIER_THRESHOLD}%），`
-      + `常見原因是股票分割沒被還原，寫入前建議先核對這些股票在對應日期是否真的有分割：`
+      `\n⚠️ ${outliers.length} 筆離群值（|報酬率| >= ${OUTLIER_THRESHOLD}%），`
+      + `常見原因是股票分割沒被還原${suffix}：`
     );
     outliers.slice(0, 20).forEach(o => {
       console.log(
@@ -368,18 +395,23 @@ async function main() {
     return;
   }
 
+  if (!effectiveRows.length) {
+    console.log('離群值排除後沒有剩下可寫入的資料。');
+    return;
+  }
+
   // ---- 寫入 ----
   console.log('\n寫入中…');
   let written = 0;
-  for (let i = 0; i < rows.length; i += 100) {
-    const chunk = rows.slice(i, i + 100);
+  for (let i = 0; i < effectiveRows.length; i += 100) {
+    const chunk = effectiveRows.slice(i, i + 100);
     await sb('verifications?on_conflict=recommendation_id,horizon', {
       method: 'POST',
       headers: { Prefer: 'resolution=ignore-duplicates,return=minimal' },
       body: JSON.stringify(chunk),
     });
     written += chunk.length;
-    process.stdout.write(`\r  ${written}/${rows.length}`);
+    process.stdout.write(`\r  ${written}/${effectiveRows.length}`);
   }
   console.log(`\n完成，寫入 ${written} 筆。`);
   if (capReached) {
