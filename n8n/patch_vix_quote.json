@@ -1,0 +1,46 @@
+{
+  "nodes": [
+    {
+      "parameters": {
+        "url": "https://cdn.cboe.com/api/global/us_indices/daily_prices/VIX_History.csv",
+        "options": {}
+      },
+      "id": "patch-vix-fetch",
+      "name": "查詢VIX指數",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        6410,
+        3060
+      ],
+      "alwaysOutputData": true,
+      "notes": "CBOE 官方資料，不需要 API key。回傳的是 JSON，內容包一個 data 欄位，裡面才是真正的 CSV 字串（DATE,OPEN,HIGH,LOW,CLOSE）。只有到前一交易日收盤，沒有當日盤中——這跟「整合報價」在盤前拿到的也是前一日收盤價一致，時間基準沒有不一致的問題。如果 n8n 沒有自動解析成 JSON（$json 底下看不到 data 欄位，而是整包純文字），把下面「解析VIX指數」節點裡的 $json.data 改成 $json.data 所在的實際欄位（或改用 { \"$json\": \"...\" } 視 n8n 回傳格式調整）"
+    },
+    {
+      "parameters": {
+        "jsCode": "// ===== 解析VIX指數 =====\nconst raw = $json.data;\nif (!raw || typeof raw !== 'string') {\n  throw new Error('[解析VIX指數] CBOE 回傳格式不是預期的字串，請檢查 API 是否變動');\n}\n\nconst lines = raw.trim().split('\\n').filter(Boolean);\nif (lines.length < 2) {\n  throw new Error('[解析VIX指數] CSV 內容異常，行數不足');\n}\n\nconst lastLine = lines[lines.length - 1];\nconst cols = lastLine.split(',');\nif (cols.length < 5) {\n  throw new Error(`[解析VIX指數] 最後一行欄位數異常：${lastLine}`);\n}\nconst [dateStr, , , , closeStr] = cols;\n\nconst dateParts = dateStr.split('/');\nif (dateParts.length !== 3) {\n  throw new Error(`[解析VIX指數] 日期格式非預期的 MM/DD/YYYY：${dateStr}`);\n}\nconst [mm, dd, yyyy] = dateParts;\nconst vixDate = `${yyyy}-${mm.padStart(2, '0')}-${dd.padStart(2, '0')}`;\nconst vixClose = Number(closeStr);\n\nif (!Number.isFinite(vixClose) || vixClose <= 0) {\n  throw new Error(`[解析VIX指數] 收盤價解析失敗：${closeStr}`);\n}\n\n// 防呆：資料太舊代表來源可能沒更新，報告不該用過期的 VIX 判斷市場情緒\nconst staleDays = Math.floor((Date.now() - new Date(vixDate + 'T00:00:00Z').getTime()) / 86400000);\nif (staleDays > 5) {\n  console.log(`[解析VIX指數] 警告：最新資料是 ${vixDate}，距今 ${staleDays} 天，可能來源沒更新`);\n}\n\nconsole.log(`[解析VIX指數] ${vixDate} 收盤 ${vixClose}`);\n\nreturn [{\n  json: {\n    ...$('整理歷史紀錄文字').first().json,\n    vixClose,\n    vixDate,\n  },\n}];\n"
+      },
+      "id": "patch-vix-parse",
+      "name": "解析VIX指數",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        6410,
+        3180
+      ]
+    }
+  ],
+  "connections": {
+    "查詢VIX指數": {
+      "main": [
+        [
+          {
+            "node": "解析VIX指數",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  }
+}
