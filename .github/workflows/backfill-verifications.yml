@@ -1,0 +1,41 @@
+name: 歷史實績回填
+
+# Alpha Vantage 免費方案一天只能查 25 檔，這批推薦涉及約 54 檔股票，
+# 需要跑好幾天才能補完。這個排程每天自動跑一次，不用手動記得執行。
+#
+# 用 --skip-outliers：排程沒有人盯著，偵測到疑似股票分割造成的離群值
+# 會自動跳過不寫入（但會留在 log 裡），避免可疑資料悄悄污染統計。
+# 想人工核對、決定要不要保留離群值，還是照舊在自己的電腦上跑不加這個旗標。
+#
+# 全部補完之後（log 會顯示「這次沒有可回填的資料」），這個排程可以停用，
+# 繼續開著也無害，只是每天都會是空跑。
+
+on:
+  schedule:
+    - cron: '0 4 * * *'   # 每天 UTC 04:00（台北時間中午 12:00）
+  workflow_dispatch: {}    # 也可以到 Actions 分頁手動觸發，方便測試
+
+permissions:
+  contents: read
+
+jobs:
+  backfill:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: 執行回填
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+          ALPHA_VANTAGE_KEY: ${{ secrets.ALPHA_VANTAGE_KEY }}
+          # 在 repo 的 Settings → Secrets and variables → Actions → Variables
+          # 新增 EXCLUDE_SYMBOLS（例如 AVGO,NVDA），核對出有問題的代碼後
+          # 不需要改程式碼或重新部署，改這裡下次執行就會生效
+          EXCLUDE_SYMBOLS: ${{ vars.EXCLUDE_SYMBOLS }}
+        run: node scripts/backfill_verifications.mjs --write --skip-outliers

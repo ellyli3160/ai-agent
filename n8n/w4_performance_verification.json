@@ -1,0 +1,311 @@
+{
+  "name": "W4 績效驗證",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "0 17 * * 1-5"
+            }
+          ]
+        }
+      },
+      "id": "w4-trigger",
+      "name": "每日盤後排程",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        0,
+        0
+      ],
+      "notes": "工作流時區必須設為 America/New_York（Settings → Timezone），否則 17:00 不是美股收盤後"
+    },
+    {
+      "parameters": {
+        "operation": "getAll",
+        "tableId": "v_pending_verifications",
+        "returnAll": true,
+        "filterType": "none"
+      },
+      "id": "w4-pending",
+      "name": "取得待驗證清單",
+      "type": "n8n-nodes-base.supabase",
+      "typeVersion": 1,
+      "position": [
+        220,
+        0
+      ],
+      "alwaysOutputData": false,
+      "credentials": {
+        "supabaseApi": {
+          "id": "EPYOTbGFYIR8FEny",
+          "name": "Supabase account-DailyUsStock"
+        }
+      },
+      "notes": "view 已經算好哪些推薦滿了 3 / 7 / 30 個交易日，這裡不需要再過濾"
+    },
+    {
+      "parameters": {
+        "jsCode": "// ===== 整理待查代碼 =====\n// 把待驗證清單裡的代碼去重，一檔只查一次報價\n\nconst rows = $input.all().map(i => i.json);\n\nif (!rows.length) {\n  console.log('[整理待查代碼] 今日無待驗證項目');\n  return [];\n}\n\nconst symbols = [...new Set(\n  rows.map(r => String(r.symbol || '').trim().toUpperCase()).filter(Boolean)\n)];\n\nconsole.log(`[整理待查代碼] 待驗證 ${rows.length} 筆，需查 ${symbols.length} 檔報價`);\nconsole.log('[整理待查代碼] 代碼：', symbols.join(','));\n\n// 護欄：正常情況一天不會超過數十檔，數量爆掉代表 view 或回填出了問題\nif (symbols.length > 80) {\n  throw new Error(\n    `[整理待查代碼] 代碼數 ${symbols.length} 異常偏高，` +\n    `請先確認 v_pending_verifications 的內容是否正確`\n  );\n}\n\nreturn symbols.map(symbol => ({ json: { symbol } }));"
+      },
+      "id": "w4-symbols",
+      "name": "整理待查代碼",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        440,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "url": "https://finnhub.io/api/v1/quote",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "symbol",
+              "value": "={{ $json.symbol }}"
+            }
+          ]
+        },
+        "options": {
+          "batching": {
+            "batch": {
+              "batchSize": 5,
+              "batchInterval": 1000
+            }
+          }
+        }
+      },
+      "id": "w4-quote",
+      "name": "取得收盤報價",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        660,
+        0
+      ],
+      "onError": "continueRegularOutput",
+      "notes": "需自行建立 Header Auth 憑證：Name = X-Finnhub-Token，Value = Finnhub API key。單檔失敗不中斷整批"
+    },
+    {
+      "parameters": {
+        "jsCode": "// ===== 計算實績 =====\n// 把報價對回待驗證清單，算出各檔在該時間點的報酬率\n\nconst quoteItems  = $input.all();\nconst symbolItems = $('整理待查代碼').all();\nconst pending     = $('取得待驗證清單').all().map(i => i.json);\n\n// ---------- 用 pairedItem 把報價對回代碼 ----------\nconst priceBySymbol = {};\nconst quoteFailed   = [];\n\nquoteItems.forEach((item, idx) => {\n  let srcIdx = idx;\n  const p = item.pairedItem;\n  if (typeof p === 'number') srcIdx = p;\n  else if (p && typeof p.item === 'number') srcIdx = p.item;\n  else if (Array.isArray(p) && typeof p[0]?.item === 'number') srcIdx = p[0].item;\n\n  const symbol = symbolItems[srcIdx]?.json?.symbol;\n  if (!symbol) return;\n\n  const close = Number(item.json?.c);\n  if (Number.isFinite(close) && close > 0) priceBySymbol[symbol] = close;\n  else quoteFailed.push(symbol);\n});\n\nif (pending.length && !Object.keys(priceBySymbol).length) {\n  throw new Error(\n    `[計算實績] 全部報價取得失敗（共 ${quoteItems.length} 次請求）。` +\n    `失敗代碼：${quoteFailed.join(',')}`\n  );\n}\n\n// ---------- 計算 ----------\nconst r3 = n => Math.round(n * 1000) / 1000;\nconst r4 = n => Math.round(n * 10000) / 10000;\n\nconst out     = [];\nconst skipped = [];\n\nfor (const row of pending) {\n  const symbol = String(row.symbol || '').trim().toUpperCase();\n  const price  = priceBySymbol[symbol];\n  const entry  = Number(row.entry_price);\n\n  if (!price) {\n    skipped.push(`${symbol}/${row.horizon}：無報價`);\n    continue;\n  }\n  if (!Number.isFinite(entry) || entry <= 0) {\n    skipped.push(`${symbol}/${row.horizon}：無有效進場價`);\n    continue;\n  }\n\n  const target = Number(row.target_price);\n  const stop   = Number(row.stop_loss);\n  const hasTarget = Number.isFinite(target) && target > 0;\n  const hasStop   = Number.isFinite(stop)   && stop   > 0;\n\n  out.push({\n    json: {\n      recommendation_id:    row.recommendation_id,\n      horizon:              row.horizon,\n      price_then:           r4(price),\n      return_pct:           r3(((price - entry) / entry) * 100),\n      // 收盤價基準：是「收盤是否已達標」，不是「盤中是否觸及」\n      hit_target:           hasTarget ? price >= target : null,\n      hit_stop:             hasStop   ? price <= stop   : null,\n      elapsed_trading_days: Number(row.elapsed_trading_days) || 0,\n      price_basis:          'close',\n      source:               'finnhub',\n    },\n  });\n}\n\nconsole.log(`[計算實績] 產出 ${out.length} 筆 / 待驗證 ${pending.length} 筆`);\nif (skipped.length)     console.log('[計算實績] 略過：', skipped.join(' | '));\nif (quoteFailed.length) console.log('[計算實績] 報價失敗：', quoteFailed.join(','));\n\nreturn out;"
+      },
+      "id": "w4-compute",
+      "name": "計算實績",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        880,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "tableId": "verifications",
+        "dataToSend": "autoMapInputData"
+      },
+      "id": "w4-write",
+      "name": "寫入驗證結果",
+      "type": "n8n-nodes-base.supabase",
+      "typeVersion": 1,
+      "position": [
+        1100,
+        0
+      ],
+      "onError": "continueRegularOutput",
+      "credentials": {
+        "supabaseApi": {
+          "id": "EPYOTbGFYIR8FEny",
+          "name": "Supabase account-DailyUsStock"
+        }
+      },
+      "notes": "(recommendation_id, horizon) 有唯一約束，重複執行時衝突列會被略過而非中斷"
+    },
+    {
+      "parameters": {
+        "operation": "getAll",
+        "tableId": "v_recommendation_results",
+        "returnAll": true,
+        "filterType": "none"
+      },
+      "id": "w4-results",
+      "name": "讀取彙總結果",
+      "type": "n8n-nodes-base.supabase",
+      "typeVersion": 1,
+      "position": [
+        1320,
+        0
+      ],
+      "alwaysOutputData": true,
+      "credentials": {
+        "supabaseApi": {
+          "id": "EPYOTbGFYIR8FEny",
+          "name": "Supabase account-DailyUsStock"
+        }
+      },
+      "notes": "讀回含歷次結果的彙總，讓 Sheets 能顯示 3 日與 7 日的累積成績"
+    },
+    {
+      "parameters": {
+        "jsCode": "// ===== 整理 Sheets 更新 =====\n// 只更新這次真的有動到的首選標的，避免每天重寫整張表\n\nconst touched = new Set(\n  $('計算實績').all().map(i => Number(i.json.recommendation_id))\n);\n\n// 防護：「讀取彙總結果」在部分 n8n 版本的 Supabase 節點分頁下\n// 偶爾會把同一批列重複吐出好幾次（實測遇過 18 筆的 view 被吐成上百筆）。\n// 這裡用 recommendation_id 去重，保留第一筆，避免下游被灌爆或重複寫入。\nconst seen = new Map();\nfor (const item of $input.all()) {\n  const id = Number(item.json.recommendation_id);\n  if (!seen.has(id)) seen.set(id, item.json);\n}\nconst rawInputCount = $input.all().length;\nconst dedupedCount  = seen.size;\nif (rawInputCount !== dedupedCount) {\n  console.log(\n    `[整理 Sheets 更新] 偵測到重複列：輸入 ${rawInputCount} 筆，` +\n    `去重後 ${dedupedCount} 筆，請檢查「讀取彙總結果」節點`\n  );\n}\n\n// v 可能是 null（該 horizon 還沒驗證過），Number(null) 在 JS 會變成 0，\n// 必須先擋掉 null/undefined，否則「還沒驗證」會被誤判成「結果是 0%」\nconst fmt = (v) => {\n  if (v === null || v === undefined) return null;\n  const n = Number(v);\n  if (!Number.isFinite(n)) return null;\n  return `${n > 0 ? '+' : ''}${n.toFixed(2)}%`;\n};\n\nconst out = [];\n\nfor (const r of seen.values()) {\n  if (r.role !== 'primary') continue;\n  if (!touched.has(Number(r.recommendation_id))) continue;\n\n  const parts = [];\n  const f3  = fmt(r.return_3d);\n  const f7  = fmt(r.return_7d);\n  const f30 = fmt(r.return_30d);\n  if (f3)  parts.push(`3日 ${f3}`);\n  if (f7)  parts.push(`7日 ${f7}`);\n  if (f30) parts.push(`30日 ${f30}`);\n\n  const n = Number(r.verified_count) || 0;\n\n  out.push({\n    json: {\n      日期:     r.report_date,\n      驗證狀態: n >= 3 ? '已完成' : `進行中 ${n}/3`,\n      驗證結果: parts.length ? parts.join('｜') : '尚無資料',\n    },\n  });\n}\n\nconsole.log(`[整理 Sheets 更新] 需更新 ${out.length} 列`);\nreturn out;"
+      },
+      "id": "w4-sheetprep",
+      "name": "整理 Sheets 更新",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1540,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "authentication": "serviceAccount",
+        "operation": "update",
+        "documentId": {
+          "__rl": true,
+          "value": "1UzgQn1N4LHzVOO5qnD7mpsBe9a8Jd9GBhKrgCkU8m9o",
+          "mode": "list",
+          "cachedResultName": "AI日報推薦記錄"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": 2026872011,
+          "mode": "list",
+          "cachedResultName": "AI日報推薦記錄"
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "日期": "={{ $json['日期'] }}",
+            "驗證狀態": "={{ $json['驗證狀態'] }}",
+            "驗證結果": "={{ $json['驗證結果'] }}"
+          },
+          "matchingColumns": [
+            "日期"
+          ],
+          "schema": []
+        },
+        "options": {}
+      },
+      "id": "w4-sheets",
+      "name": "更新驗證欄位",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.7,
+      "position": [
+        1760,
+        0
+      ],
+      "onError": "continueRegularOutput",
+      "credentials": {
+        "googleApi": {
+          "id": "oOiFDGDTYWxeZ2ww",
+          "name": "Google Service Account account"
+        }
+      },
+      "notes": "以「日期」欄比對更新既有列。Sheets 寫入失敗不影響 Supabase 已寫入的驗證資料"
+    }
+  ],
+  "connections": {
+    "每日盤後排程": {
+      "main": [
+        [
+          {
+            "node": "取得待驗證清單",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "取得待驗證清單": {
+      "main": [
+        [
+          {
+            "node": "整理待查代碼",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "整理待查代碼": {
+      "main": [
+        [
+          {
+            "node": "取得收盤報價",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "取得收盤報價": {
+      "main": [
+        [
+          {
+            "node": "計算實績",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "計算實績": {
+      "main": [
+        [
+          {
+            "node": "寫入驗證結果",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "寫入驗證結果": {
+      "main": [
+        [
+          {
+            "node": "讀取彙總結果",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "讀取彙總結果": {
+      "main": [
+        [
+          {
+            "node": "整理 Sheets 更新",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "整理 Sheets 更新": {
+      "main": [
+        [
+          {
+            "node": "更新驗證欄位",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "timezone": "America/New_York"
+  },
+  "pinData": {}
+}
