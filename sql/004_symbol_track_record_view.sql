@@ -18,6 +18,8 @@
 -- 隨時間悄悄減少。這裡直接對 verifications 表算 bool_or，不受 180 天限制，
 -- 歷史紀錄的次數不會因為時間經過而改變。
 --
+-- 只看最近 28 天內的推薦（使用者指定，非資料分析得出的門檻）。
+--
 -- 執行：在 001~003 之後執行，可重複執行（create or replace view）
 -- ============================================================================
 
@@ -39,6 +41,7 @@ left join (
   group by recommendation_id
 ) ver on ver.recommendation_id = r.id
 where r.role = 'primary'
+  and r.report_date >= (now() at time zone 'America/New_York')::date - interval '28 days'
 group by r.symbol;
 
 -- PostgreSQL 15 以上才支援 security_invoker，若報錯可略過這行
@@ -50,9 +53,6 @@ grant select on v_symbol_track_record to service_role;
 -- ----------------------------------------------------------------------------
 -- 驗收
 -- ----------------------------------------------------------------------------
--- 已在 daily-us-stock 專案實測（2026-09-23），對照已知案例：
--- CRWD: 5 次 / 1 次達標 / 3 次停損 / 1 次未驗證
--- LMT : 8 次 / 1 次達標 / 3 次停損 / 3 次未驗證
--- MU  : 5 次 / 3 次達標 / 1 次停損 / 2 次未驗證
--- XOM : 8 次 / 1 次達標 / 3 次停損 / 4 次未驗證
+-- 已在 daily-us-stock 專案實測（2026-09-23），28 天窗口內有 11 檔標的，
+-- 次數最高的是 NVDA（3 次）與 CRWD／META（各 2 次），數字會隨時間持續變動。
 select * from v_symbol_track_record order by primary_rec_count desc;
