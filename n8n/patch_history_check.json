@@ -1,0 +1,54 @@
+{
+  "nodes": [
+    {
+      "parameters": {
+        "operation": "getAll",
+        "tableId": "v_symbol_track_record",
+        "returnAll": true,
+        "filterType": "none"
+      },
+      "id": "patch-history-query",
+      "name": "查詢股票歷史紀錄",
+      "type": "n8n-nodes-base.supabase",
+      "typeVersion": 1,
+      "position": [
+        6410,
+        2700
+      ],
+      "alwaysOutputData": true,
+      "credentials": {
+        "supabaseApi": {
+          "id": "EPYOTbGFYIR8FEny",
+          "name": "Supabase account-DailyUsStock"
+        }
+      },
+      "notes": "讀 v_symbol_track_record（見 sql/004），回傳所有標的的歷史推薦彙總，不需篩選"
+    },
+    {
+      "parameters": {
+        "jsCode": "// ===== 整理歷史紀錄文字 =====\n// 把「查詢股票歷史紀錄」讀到的 v_symbol_track_record 整理成文字，\n// 讓「報告」節點在挑首選標的前，能看到每檔候選標的過去被推薦過幾次、結果如何。\n// 依據：對 2025-2026 實際推薦資料的分析，重複推薦同一檔股票的達標率明顯低於\n// 首次推薦（62% vs 38%），模型應避免在沒有新催化劑時重複挑選近期已推薦過的標的。\n\nconst upstream = $('整合報價').first().json;\nconst candidates = Array.isArray(upstream.availableSymbols) ? upstream.availableSymbols : [];\n\nlet records = [];\ntry {\n  records = $input.all().map(i => i.json);\n} catch (e) {\n  console.log('[整理歷史紀錄文字] 取不到「查詢股票歷史紀錄」，本次不附歷史資訊：', e.message);\n}\n\n// 防呆：Supabase getAll 節點在部分分頁情況下可能吐出重複列（W4 已遇過同樣狀況），\n// 這裡用 symbol 去重，保留第一筆\nconst bySymbol = new Map();\nfor (const r of records) {\n  if (r && r.symbol && !bySymbol.has(r.symbol)) bySymbol.set(r.symbol, r);\n}\n\nconst lines = candidates.map(sym => {\n  const rec = bySymbol.get(sym);\n  if (!rec || !rec.primary_rec_count) return `${sym}：尚未被推薦過`;\n\n  const parts = [`共 ${rec.primary_rec_count} 次`];\n  if (rec.last_primary_date) parts.push(`最近一次 ${rec.last_primary_date}`);\n  const verified = Number(rec.target_hit_count || 0) + Number(rec.stop_hit_count || 0);\n  if (verified > 0) {\n    parts.push(`已驗證 ${verified} 次中：達標 ${rec.target_hit_count || 0} 次、觸停損 ${rec.stop_hit_count || 0} 次`);\n  }\n  if (rec.unverified_count > 0) parts.push(`另有 ${rec.unverified_count} 次尚未驗證完成`);\n\n  return `${sym}：歷史推薦${parts.join('，')}`;\n});\n\nconst historyText = lines.length\n  ? lines.join('\\n')\n  : '（本次無候選標的資訊，略過歷史紀錄檢查）';\n\nconsole.log('[整理歷史紀錄文字]\\n' + historyText);\n\nreturn [{\n  json: {\n    ...upstream,\n    historyText,\n  },\n}];\n"
+      },
+      "id": "patch-history-format",
+      "name": "整理歷史紀錄文字",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        6410,
+        2930
+      ]
+    }
+  ],
+  "connections": {
+    "查詢股票歷史紀錄": {
+      "main": [
+        [
+          {
+            "node": "整理歷史紀錄文字",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  }
+}
