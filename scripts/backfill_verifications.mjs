@@ -89,7 +89,12 @@ async function sb(path, init = {}) {
   if (!res.ok) {
     throw new Error(`Supabase ${res.status} ${path}：${(await res.text()).slice(0, 300)}`);
   }
-  return res.status === 204 ? null : res.json();
+  // 不能只看狀態碼判斷有沒有內容：帶 Prefer: return=minimal 的寫入，
+  // PostgREST 回的是 201（不是 204）但 body 是空字串，直接對空字串
+  // 呼叫 res.json() 會丟 SyntaxError: Unexpected end of JSON input。
+  // 讀 text 再視情況解析，任何狀態碼、任何情況下的空 body 都安全。
+  const text = await res.text();
+  return text ? JSON.parse(text) : null;
 }
 
 // ----------------------------------------------------------- Alpha Vantage
