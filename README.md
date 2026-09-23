@@ -21,6 +21,7 @@ Google Sheets 的「驗證狀態」永遠停在待驗證，3 / 7 / 30 日報酬�
 | `n8n/patch_write_recommendations.json` | 加進現有工作流的兩個節點，讓每日推薦寫進 `recommendations` |
 | `n8n/w4_performance_verification.json` | W4 績效驗證工作流，每交易日盤後回填實際報酬 |
 | `scripts/backfill_verifications.mjs` | 一次性補上歷史推薦的實際績效 |
+| `.github/workflows/backfill-verifications.yml` | 每天自動跑上面那支腳本，直到全部補完 |
 
 ---
 
@@ -44,9 +45,12 @@ Supabase 端已經在正式專案 `daily-us-stock` 上直接執行完成：schem
 - [x] `sql/003_backfill_watchlist_heat.sql` 已執行，補齊 002 漏掉的
       watchlist `heat` 欄位（355 筆空值補到剩 164 筆，剩下的是資料源頭
       本來就沒有這項資訊，非腳本問題）
-- [ ] `scripts/backfill_verifications.mjs` 歷史實績回填：資料源已從
+- [~] `scripts/backfill_verifications.mjs` 歷史實績回填：資料源已從
       Stooq（使用者的電腦也連不上，判斷加了防爬蟲機制）改為 Alpha
-      Vantage，待你申請 API key 後執行
+      Vantage，已手動試跑過並修正兩個 bug（見下方）；免費額度一天只夠
+      約 24 檔，涉及 54 檔股票要跑好幾天，已加上
+      `.github/workflows/backfill-verifications.yml` 排程自動化，
+      待你在 repo 設定 Secrets 後即可自動每天接續執行到補完為止
 
 ### 資料源限制：Alpha Vantage 免費方案只能查最近約 100 個交易日
 
@@ -181,18 +185,44 @@ Code in JavaScript ─┬─→ 每日報告 → Telegram / LINE
 ### 5. 回填歷史實績（選用，但建議做）
 
 W4 取的是執行當下的報價，只能驗證從今天起產生的推薦。
-既有 89 筆歷史推薦的驗證窗口都已經過去，要用歷史收盤價一次補上：
+既有歷史推薦的驗證窗口都已經過去，要用歷史收盤價一次補上：
 
 ```bash
 export SUPABASE_URL=https://xxxx.supabase.co
 export SUPABASE_SERVICE_KEY=eyJ...          # service_role key
+export ALPHA_VANTAGE_KEY=xxxxxxxx           # 免費申請：https://www.alphavantage.co/support/#api-key
 
 node scripts/backfill_verifications.mjs --probe   # 先確認資料源可用
 node scripts/backfill_verifications.mjs           # 試跑，只印結果不寫入
 node scripts/backfill_verifications.mjs --write   # 確認數字合理後正式寫入
 ```
 
-回填完成後就有約 250 筆實績可以統計，不必等三個月。
+免費方案一天只能查 25 檔，這批推薦涉及約 54 檔股票，一次跑不完；跑到
+額度上限會自動優雅停止，隔天重跑同一個指令即可自動接續，不用自己追蹤
+進度。如果摘要裡出現離群值警告，先核對是不是股票分割造成的，再決定
+要不要寫入，或用 `EXCLUDE_SYMBOLS=AVGO,XXX` 排除有問題的代碼。
+
+### 6. 設定自動排程（選用，省得每天手動重跑）
+
+`.github/workflows/backfill-verifications.yml` 會每天自動跑一次第 5 步
+的腳本，用 `--skip-outliers`（排程沒有人盯著，偵測到離群值會自動跳過
+不寫入，但會留在 Actions 的 log 裡）。全部補完之前你不需要手動做任何事。
+
+到 repo 的 **Settings → Secrets and variables → Actions**：
+
+**Secrets**（New repository secret，三個都要）：
+- `SUPABASE_URL`
+- `SUPABASE_SERVICE_KEY`
+- `ALPHA_VANTAGE_KEY`
+
+**Variables**（選用，New repository variable）：
+- `EXCLUDE_SYMBOLS`：核對出有問題的股票代碼後填在這裡（例如
+  `AVGO,NVDA`），不需要改程式碼，下次排程執行就會生效
+
+設定完可以到 **Actions** 分頁找到「歷史實績回填」這個 workflow，手動
+按 **Run workflow** 先測一次，確認 log 沒有噴錯。全部補完之後
+（log 會顯示「這次沒有可回填的資料」），這個排程可以停用，繼續開著
+也無害，只是每天都會是空跑。
 
 ---
 
